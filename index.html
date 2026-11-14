@@ -167,6 +167,7 @@ button,input,select,textarea{font:inherit;color:inherit}
       <button class="btn danger" id="bClear">清空家具</button>
       <button class="btn primary" id="bJson">{ } 场景数据</button>
       <button class="btn" id="bExport" title="导出整个房间（含门窗、家具、贴图）">⬇ 导出 GLB</button>
+      <button class="btn" id="bExport3dm" title="导出为 Rhino .3dm（毫米，Z 轴向上，按墙/地面/门窗/家具分图层；Revit 2022+ 可导入）">⬇ 导出 3DM</button>
     </div>
     <div class="status" id="status"></div>
   </header>
@@ -2148,15 +2149,16 @@ function makeZip(name, data){            // single-file "store" zip, no external
   return new Blob([lh, nm, data, ch, nm, en]);
 }
 const safeName = s => String(s).replace(/[^\w一-龥-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 30) || 'model';
-async function deliverFile(filename, buf){
+async function deliverFile(filename, buf, mime='model/gltf-binary'){
   const dl = await cap('downloads');
-  if(dl){      // inside Claude: .glb is not an allowed download type, so ship it zipped
-    const zipName = filename.replace(/\.glb$/i, '.zip');
-    try { await dl.save({filename: zipName, data: makeZip(filename, new Uint8Array(buf))}); toast(`已保存 ${zipName}（解压后得到 .glb）`); }
+  const ext = (filename.match(/\.([A-Za-z0-9]+)$/) || [,''])[1];
+  if(dl){      // inside Claude only some file types may be downloaded, so ship it zipped
+    const zipName = filename.replace(/\.[A-Za-z0-9]+$/, '.zip');
+    try { await dl.save({filename: zipName, data: makeZip(filename, new Uint8Array(buf))}); toast(`已保存 ${zipName}（解压后得到 .${ext}）`); }
     catch(e){ if(e?.code !== 'declined') toast('无法保存：' + (e?.message || e?.code), true); }
     return;
   }
-  const url = URL.createObjectURL(new Blob([buf], {type:'model/gltf-binary'}));
+  const url = URL.createObjectURL(new Blob([buf], {type:mime}));
   const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000); toast(`已导出 ${filename}`);
 }
@@ -2183,6 +2185,119 @@ async function exportScene(){
   const fresh = [];
   for(const it of state.items){ const g = makeGroup(it); g.position.set(it.x, 0, it.z); g.rotation.y = it.rot*DEG; g.name = info(it).name; root.add(g); fresh.push(g); }
   await exportAndDeliver(root, 'roomkit-scene.glb'); fresh.forEach(disposeGroup);
+}
+
+/* ================= 3DM / OBJ export ================= */
+// Rhino 3dm via rhino3dm.js (openNURBS compiled to WebAssembly), loaded only when the button is pressed.
+const RHINO_URL = 'https://cdn.jsdelivr.net/npm/rhino3dm@8.4.0/rhino3dm.module.js';
+let rhinoP = null;
+function loadRhino(){
+  return rhinoP ??= Promise.race([
+    import(RHINO_URL).then(m => (m.default || m)()),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('加载超时')), 25000)),
+  ]).catch(e => { rhinoP = null; throw e; });
+}
+const LAYER_DEF = {'墙':'#d9d3c7', '地面':'#c9a574', '门窗':'#7fa8c9', '家具':'#8a8f98'};
+const FLOOR_HEX = {wood:0xc4a076, oak:0x70503a, tile:0xe6e3dc, concrete:0xb9b6b0};
+const hexRGB = h => ({r:(h >> 16) & 255, g:(h >> 8) & 255, b:h & 255, a:255});
+// three.js (m, y up, z toward viewer in plan) -> Rhino (mm, z up, y = north). A proper rotation, so triangle winding is kept.
+function meshToPart(part, geo, e){
+  const pos = geo.attributes?.position; if(!pos) return;
+  const base = part.v.length / 3, idx = geo.index;
+  for(let i=0;i<pos.count;i++){
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const X = e[0]*x + e[4]*y + e[8]*z + e[12], Y = e[1]*x + e[5]*y + e[9]*z + e[13], Z = e[2]*x + e[6]*y + e[10]*z + e[14];
+    part.v.push(X*1000, -Z*1000, Y*1000);
+  }
+  const det = e[0]*(e[5]*e[10] - e[9]*e[6]) - e[4]*(e[1]*e[10] - e[9]*e[2]) + e[8]*(e[1]*e[6] - e[5]*e[2]), flip = det < 0;
+  const n = idx ? idx.count : pos.count;
+  for(let i=0;i+2<n;i+=3){
+    const a = idx ? idx.getX(i) : i, b = idx ? idx.getX(i+1) : i+1, c = idx ? idx.getX(i+2) : i+2;
+    part.f.push(base + a, base + (flip ? c : b), base + (flip ? b : c));
+  }
+}
+function collectParts(){
+  const parts = new Map();
+  const add = (layer, name, hex, uid, mesh) => {
+    const key = layer + '|' + uid + '|' + hex;
+    let p = parts.get(key); if(!p) parts.set(key, p = {layer, name, hex, v:[], f:[]});
+    meshToPart(p, mesh.geometry, mesh.matrixWorld.elements);
+  };
+  const colorOf = o => { const m = Array.isArray(o.material) ? o.material[0] : o.material; return m?.color ? m.color.getHex() : 0xcccccc; };
+  const room = roomGroup.clone(true);
+  room.traverse(o => { if(o.isGroup && o.userData?.wall != null) o.scale.y = 1; });   // undo the "wall fades when it blocks the view" effect
+  room.updateMatrixWorld(true);
+  for(const ch of room.children){
+    if(ch.userData?.room != null && ch.isMesh){
+      const r = getRoom(ch.userData.room);
+      add('地面', r?.name || '地面', FLOOR_HEX[r?.floor] ?? 0xc4a076, 'r' + ch.userData.room, ch);
+    } else if(ch.userData?.wall != null){
+      const wi = state.walls.findIndex(w => w.id === ch.userData.wall) + 1;
+      ch.traverseVisible(o => {
+        if(!o.isMesh || o.userData?.noPick) return;
+        let n = o, oid = null;
+        while(n && n !== ch){ if(n.userData?.oid != null){ oid = n.userData.oid; break; } n = n.parent; }
+        if(oid != null){ const op = getOp(oid); add('门窗', op ? OPEN_CAT[op.kind].name : '门窗', colorOf(o), 'o' + oid, o); }
+        else add('墙', '墙 ' + wi, colorOf(o), 'w' + ch.userData.wall, o);
+      });
+    }
+  }
+  for(const it of state.items){
+    const g = makeGroup(it); g.position.set(it.x, 0, it.z); g.rotation.y = it.rot*DEG; g.updateMatrixWorld(true);
+    g.traverseVisible(o => { if(o.isMesh && !o.userData?.noPick) add('家具', info(it).name, colorOf(o), 'i' + it.id, o); });
+    disposeGroup(g);
+  }
+  return [...parts.values()].filter(p => p.f.length);
+}
+async function build3dm(parts){
+  const rhino = await loadRhino();
+  const doc = new rhino.File3dm();
+  try { doc.settings().modelUnitSystem = rhino.UnitSystem.Millimeters; } catch {}
+  const cnt = t => typeof t.count === 'function' ? t.count() : t.count;
+  const layerIdx = {}; let k = 0;
+  for(const [name, col] of Object.entries(LAYER_DEF)){
+    const l = new rhino.Layer(); l.name = name; l.color = hexRGB(parseInt(col.slice(1), 16));
+    doc.layers().add(l);
+    const c = cnt(doc.layers()); layerIdx[name] = Number.isFinite(c) ? c - 1 : k; k++;
+  }
+  for(const p of parts){
+    const m = new rhino.Mesh(), vs = m.vertices(), fs = m.faces();
+    for(let i=0;i<p.v.length;i+=3) vs.add(p.v[i], p.v[i+1], p.v[i+2]);
+    for(let i=0;i<p.f.length;i+=3) fs.addTriFace(p.f[i], p.f[i+1], p.f[i+2]);
+    try { m.normals().computeNormals(); } catch {}
+    try { m.compact(); } catch {}
+    const at = new rhino.ObjectAttributes();
+    at.layerIndex = layerIdx[p.layer]; at.name = p.name;
+    at.objectColor = hexRGB(p.hex); at.colorSource = rhino.ObjectColorSource.ColorFromObject;
+    doc.objects().add(m, at);
+  }
+  const out = doc.toByteArray().slice();
+  try { doc.delete(); } catch {}
+  return out;
+}
+function buildObj(parts){        // fallback when the 3dm library cannot be loaded; Rhino / Revit-via-plugins / Blender all read OBJ
+  const L = ['# RoomKit scene, units: mm, Z up'];
+  let off = 1;
+  for(const p of parts){
+    L.push('o ' + (p.layer + '_' + p.name).replace(/\s+/g, '_'));
+    for(let i=0;i<p.v.length;i+=3) L.push(`v ${p.v[i].toFixed(2)} ${p.v[i+1].toFixed(2)} ${p.v[i+2].toFixed(2)}`);
+    for(let i=0;i<p.f.length;i+=3) L.push(`f ${p.f[i]+off} ${p.f[i+1]+off} ${p.f[i+2]+off}`);
+    off += p.v.length / 3;
+  }
+  return L.join('\n') + '\n';
+}
+async function exportRhino(){
+  if(!state.items.length && !state.walls.length && !state.rooms.length){ toast('场景是空的，没有可导出的内容', true); return; }
+  toast('正在导出 3DM …');
+  let parts;
+  try { parts = collectParts(); } catch(e){ toast('导出失败：' + (e?.message || e), true); return; }
+  try {
+    await deliverFile('roomkit-scene.3dm', await build3dm(parts), 'application/octet-stream');
+  } catch(e){
+    console.warn('3dm export failed, falling back to OBJ', e);
+    await deliverFile('roomkit-scene.obj', new TextEncoder().encode(buildObj(parts)), 'text/plain');
+    toast('3DM 组件没能加载（可能被网络或沙盒阻止），已改为导出 OBJ，Rhino 可直接打开', true);
+  }
 }
 
 /* ================= Image -> 3D ================= */
@@ -2299,7 +2414,7 @@ function updateStatus(){
 $('#bUndo').onclick = undo; $('#bRedo').onclick = redo;
 function toggleSnap(){ snapOn = !snapOn; $('#bSnap').classList.toggle('on', snapOn); toast(snapOn ? '网格吸附：开（50mm）' : '网格吸附：关'); }
 function toggleCol(){ collisionOn = !collisionOn; $('#bCol').classList.toggle('on', collisionOn); toast(collisionOn ? '碰撞检测：开' : '碰撞检测：关（允许重叠）'); sync(); }
-$('#bSnap').onclick = toggleSnap; $('#bCol').onclick = toggleCol; $('#bExport').onclick = exportScene;
+$('#bSnap').onclick = toggleSnap; $('#bCol').onclick = toggleCol; $('#bExport').onclick = exportScene; $('#bExport3dm').onclick = exportRhino;
 let wallMode = 'auto';
 const WALL_MODES = {auto:'墙体：自动降低', full:'墙体：全高', low:'墙体：全部降低'};
 $('#bWalls').onclick = () => { wallMode = {auto:'full', full:'low', low:'auto'}[wallMode]; $('#bWalls').textContent = '▥ ' + WALL_MODES[wallMode]; toast(WALL_MODES[wallMode]); };
