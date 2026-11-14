@@ -187,6 +187,11 @@ button,input,select,textarea{font:inherit;color:inherit}
           <button data-v="top">俯视</button>
           <button data-v="plan">2D 平面</button>
         </div>
+        <div class="seg" id="rndSeg">
+          <button id="bRender" title="渲染模式：真实感光照 (X)">✨ 渲染</button>
+          <button data-pre="day" hidden>白天</button><button data-pre="dusk" hidden>黄昏</button><button data-pre="night" hidden>夜晚</button>
+          <button id="bShot" title="保存当前画面为高清 PNG" hidden>📷 保存图片</button>
+        </div>
         <div class="seg" id="tools">
           <button data-tool="select" class="on" title="选择 (V)">↖ 选择</button>
           <button data-tool="room" title="画房间 (B)">▱ 画房间</button>
@@ -707,7 +712,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color('#e7e3dc');
 const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 200);
 camera.position.set(6.2, 6.4, 7.6);
-scene.add(new THREE.HemisphereLight(0xffffff, 0xcabfae, 1.35));
+const hemi = new THREE.HemisphereLight(0xffffff, 0xcabfae, 1.35); scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff4e6, 2.2);
 sun.position.set(4, 8, 3.5); sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02;
@@ -716,6 +721,7 @@ const fill = new THREE.DirectionalLight(0xdfe8ff, 0.5); fill.position.set(-5, 4,
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(200,200), new THREE.MeshStandardMaterial({color:'#ddd8cf', roughness:1}));
 ground.rotation.x = -Math.PI/2; ground.position.y = -0.002; ground.receiveShadow = true; scene.add(ground);
 const roomGroup = new THREE.Group(); scene.add(roomGroup);
+let sunOff = [4, 9, 3.5];       // sun position relative to the scene centre (changed by the render presets)
 const itemsRoot = new THREE.Group(); scene.add(itemsRoot);
 let walls = [], roomKey = '';
 
@@ -883,6 +889,14 @@ function buildOpeningModel(o, sign, t=T){
   }
   return g;
 }
+function placeSun(){
+  const B = sceneBounds(), R = Math.max(B.w, B.d)/2 + 2;
+  if(!sun.target.parent) scene.add(sun.target);
+  const len = Math.hypot(...sunOff), dist = Math.max(len, R*1.2 + 4), k = dist/len;
+  sun.position.set(B.cx + sunOff[0]*k, sunOff[1]*k, B.cz + sunOff[2]*k); sun.target.position.set(B.cx, 0, B.cz); sun.target.updateMatrixWorld();
+  Object.assign(sun.shadow.camera, {left:-R, right:R, top:R, bottom:-R, near:0.5, far:dist + R*2 + 10});
+  sun.shadow.camera.updateProjectionMatrix();
+}
 function buildRoom(){
   const S = state.settings, H = S.h;
   roomGroup.traverse(o => {
@@ -917,11 +931,7 @@ function buildRoom(){
     piece(cur, g0.L + eb, 0, H);
     g.userData.wall = w.id; roomGroup.add(g); walls.push(g);
   }
-  const B = sceneBounds(), R = Math.max(B.w, B.d)/2 + 2;
-  if(!sun.target.parent) scene.add(sun.target);
-  sun.position.set(B.cx + 4, 9, B.cz + 3.5); sun.target.position.set(B.cx, 0, B.cz); sun.target.updateMatrixWorld();
-  Object.assign(sun.shadow.camera, {left:-R, right:R, top:R, bottom:-R, near:0.5, far:40});
-  sun.shadow.camera.updateProjectionMatrix();
+  placeSun();
 }
 const curRoomKey = () => JSON.stringify([state.settings, state.walls, state.rooms, state.openings]);
 
@@ -1226,13 +1236,13 @@ function sync(opts = {}){
       e = {g: makeGroup(it), key}; itemsRoot.add(e.g); meshes.set(it.id, e);
     }
     e.g.position.set(it.x, 0, it.z); e.g.rotation.y = it.rot*DEG;
-    setTint(e.g, collides(it) ? 0xff2a2a : null);
+    setTint(e.g, !RQ.on && collides(it) ? 0xff2a2a : null);
   }
   for(const [id, e] of meshes) if(!ids.has(id)){ itemsRoot.remove(e.g); disposeGroup(e.g); meshes.delete(id); }
   if(selectedId && !getItem(selectedId) && !getOp(selectedId) && !getWall(selectedId) && !getRoom(selectedId)) selectedId = null;
   drawPlan();
   if(!opts.keepInspector) renderInspector();
-  updateStatus(); saveLocal();
+  updateStatus(); saveLocal(); RQ.dirty = true;
   $('#bUndo').disabled = !past.length; $('#bRedo').disabled = !future.length;
 }
 function commit(){
@@ -1424,7 +1434,7 @@ function setView(v){
 }
 function setFull(on){
   if(full === on) return;
-  full = on; $('#planbox').classList.toggle('full', on);
+  full = on; $('#planbox').classList.toggle('full', on); $('#rndSeg').style.display = on ? 'none' : '';
   if(on) pvManual = false; else setTool('select');
   $('#dim').style.display = 'none';
   setHint(); drawPlan();
@@ -2477,6 +2487,7 @@ window.addEventListener('keydown', e => {
   if(k === 'w') return setTool('wall');
   if(k === 'p') return setView(full ? viewMode : 'plan');
   if(k === 'g') return toggleSnap();
+  if(k === 'x') return toggleRender();
   if(k === 'c') return toggleCol();
   if(k === 't') return setView(viewMode === 'top' && !full ? 'persp' : 'top');
   if(k === 'escape') return select(null);
@@ -2502,6 +2513,79 @@ window.addEventListener('keydown', e => {
     snapOn = was;
   }
 });
+
+
+/* ================= Render mode (real-time, higher-quality lighting) ================= */
+const RQ = {on:false, preset:'day', dirty:true, env:null, lightsKey:''};
+const R_OFF = {bg:'#e7e3dc', sky:0xffffff, gnd:0xcabfae, hemi:1.35, sun:0xfff4e6, sunI:2.2, sunOff:[4, 9, 3.5], fill:0.5, env:1, exp:1.05, floor:'#ddd8cf', room:0, lamp:0};
+const R_PRE = {
+  day:   {...R_OFF, bg:'#d3e3f3', sky:0xdbe9ff, gnd:0xd6cbb8, hemi:0.35, sun:0xfff0d8, sunI:3.6, sunOff:[7, 10, 4], fill:0.15, env:0.7, exp:1.0, floor:'#cfcabf'},
+  dusk:  {...R_OFF, bg:'#d9a07c', sky:0xffc79a, gnd:0x6d5a56, hemi:0.2, sun:0xff9f55, sunI:2.4, sunOff:[10, 3.2, 2.5], fill:0.08, env:0.25, exp:1.0, floor:'#a99483', room:12, lamp:4},
+  night: {...R_OFF, bg:'#0e1219', sky:0x7f9cd6, gnd:0x20242c, hemi:0.06, sun:0x8fb0ff, sunI:0.35, sunOff:[-6, 9, -4], fill:0.02, env:0.06, exp:1.15, floor:'#202228', room:26, lamp:7},
+};
+const rLights = new THREE.Group(); scene.add(rLights);
+function applyPreset(){
+  const P = RQ.on ? R_PRE[RQ.preset] : R_OFF;
+  scene.background.set(P.bg); ground.material.color.set(P.floor);
+  hemi.color.setHex(P.sky); hemi.groundColor.setHex(P.gnd); hemi.intensity = P.hemi;
+  sun.color.setHex(P.sun); sun.intensity = P.sunI; fill.intensity = P.fill;
+  sunOff = P.sunOff; placeSun();
+  renderer.toneMappingExposure = P.exp;
+  const ms = RQ.on ? 4096 : 2048;
+  if(sun.shadow.mapSize.x !== ms){ sun.shadow.map?.dispose(); sun.shadow.map = null; sun.shadow.mapSize.set(ms, ms); }
+  scene.environment = RQ.on ? RQ.env : null;
+  RQ.dirty = true;
+}
+function refreshRender(){
+  RQ.dirty = false;
+  const P = R_PRE[RQ.preset], k = RQ.on ? P.env : 1;
+  scene.traverse(o => {
+    if(!o.isMesh) return;
+    if(o.userData?.noPick) o.visible = !RQ.on;                // door-swing hints are editing aids
+    for(const m of (Array.isArray(o.material) ? o.material : [o.material])) if('envMapIntensity' in m) m.envMapIntensity = k;
+  });
+  const spec = [];
+  if(RQ.on && P.room > 0) for(const r of state.rooms){ const lp = labelPoint(r); spec.push([lp.x, state.settings.h - 0.2, lp.z, P.room, 0xffd8a8]); }
+  if(RQ.on && P.lamp > 0) for(const it of state.items) if(it.type === 'lamp') spec.push([it.x, it.h*0.85, it.z, P.lamp, 0xffd09a]);
+  const key = JSON.stringify(spec);
+  if(key !== RQ.lightsKey){
+    RQ.lightsKey = key; rLights.clear();
+    for(const [x, y, z, I, c] of spec){ const l = new THREE.PointLight(c, I, 0, 2); l.position.set(x, y, z); rLights.add(l); }
+  }
+  for(const it of state.items){ const e = meshes.get(it.id); if(e) setTint(e.g, !RQ.on && collides(it) ? 0xff2a2a : null); }
+}
+async function setRender(on, preset){
+  if(preset) RQ.preset = preset;
+  RQ.on = on;
+  if(on && !RQ.env){
+    try {
+      const {RoomEnvironment} = await import('three/addons/environments/RoomEnvironment.js');
+      const pm = new THREE.PMREMGenerator(renderer);
+      RQ.env = pm.fromScene(new RoomEnvironment(), 0.04).texture; pm.dispose();
+    } catch(e){ console.warn(e); toast('环境光反射组件没能加载，已使用基础光照', true); }
+  }
+  applyPreset();
+  $('#bRender').classList.toggle('on', on);
+  document.querySelectorAll('#rndSeg [data-pre]').forEach(b => { b.hidden = !on; b.classList.toggle('on', b.dataset.pre === RQ.preset); });
+  $('#bShot').hidden = !on;
+}
+const toggleRender = () => setRender(!RQ.on);
+$('#bRender').onclick = toggleRender;
+$('#rndSeg').addEventListener('click', e => { const b = e.target.closest('[data-pre]'); if(b) setRender(true, b.dataset.pre); });
+async function saveRender(){
+  if(full){ toast('请先切换到 3D 视图', true); return; }
+  const w0 = view.clientWidth, h0 = view.clientHeight, k = 2560/Math.max(w0, h0), W = Math.round(w0*k), H = Math.round(h0*k);
+  let blob = null;
+  try {
+    renderer.setPixelRatio(1); renderer.setSize(W, H, false); camera.aspect = W/H; camera.updateProjectionMatrix();
+    if(RQ.dirty) refreshRender();
+    selLine.visible = false; renderer.render(scene, camera);
+    blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+  } catch(e){ toast('保存失败：' + (e?.message || e), true); }
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); resize();
+  if(blob) await deliverFile('roomkit-render.png', await blob.arrayBuffer(), 'image/png');
+}
+$('#bShot').onclick = saveRender;
 
 /* ================= Render loop ================= */
 const selLine = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([0,1,2,3].map(()=>new THREE.Vector3())), new THREE.LineBasicMaterial({color:'#1f6f68', depthTest:false}));
@@ -2566,6 +2650,8 @@ function loop(now){
   } else if(rm){
     const lp = labelPoint(rm); showLabel(lp.x, 0.2, lp.z, `${rm.name} · ${Math.abs(polyArea(rm.pts)).toFixed(1)} m²`, false);
   }
+  if(RQ.on){ selLine.visible = false; dim.style.display = 'none'; }
+  if(RQ.dirty) refreshRender();
   renderer.render(scene, camera);
 }
 

@@ -10,6 +10,7 @@ A single-file 3D interior-design editor that runs in the browser (HTML + Three.j
 - Import GLB models, export GLB (single item or whole scene)
 - Export Rhino `.3dm` (millimetres, Z up, layers: walls / floors / doors & windows / furniture; meshes, not NURBS). Revit 2022+ can import `.3dm` as reference geometry. Falls back to `.obj` if the rhino3dm WebAssembly library cannot be loaded.
 - Image to 3D model (only works inside Claude, uses the page `sample` capability)
+- Render mode (`X`): environment-lit (IBL) real-time rendering with soft shadows, day / dusk / night presets (night and dusk switch on ceiling and floor-lamp lights), and a button to save a 2560 px PNG
 - Undo/redo, autosave (localStorage + IndexedDB), JSON import/export
 - Views: 3D perspective, top, 2D plan
 
