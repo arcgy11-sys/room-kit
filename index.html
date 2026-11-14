@@ -2148,15 +2148,21 @@ function cap(name){
 /* ================= GLB export ================= */
 const CRC_T = (() => { const t = new Uint32Array(256); for(let n=0;n<256;n++){ let c = n; for(let k=0;k<8;k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
 function crc32(u8){ let c = 0xFFFFFFFF; for(let i=0;i<u8.length;i++) c = CRC_T[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
-function makeZip(name, data){            // single-file "store" zip, no external library
-  const nm = new TextEncoder().encode(name), crc = crc32(data), n = data.length;
-  const lh = new DataView(new ArrayBuffer(30)), ch = new DataView(new ArrayBuffer(46)), en = new DataView(new ArrayBuffer(22));
-  lh.setUint32(0,0x04034b50,true); lh.setUint16(4,20,true); lh.setUint16(6,0x0800,true); lh.setUint16(12,0x21,true);
-  lh.setUint32(14,crc,true); lh.setUint32(18,n,true); lh.setUint32(22,n,true); lh.setUint16(26,nm.length,true);
-  ch.setUint32(0,0x02014b50,true); ch.setUint16(4,20,true); ch.setUint16(6,20,true); ch.setUint16(8,0x0800,true); ch.setUint16(14,0x21,true);
-  ch.setUint32(16,crc,true); ch.setUint32(20,n,true); ch.setUint32(24,n,true); ch.setUint16(28,nm.length,true);
-  en.setUint32(0,0x06054b50,true); en.setUint16(8,1,true); en.setUint16(10,1,true); en.setUint32(12,46+nm.length,true); en.setUint32(16,30+nm.length+n,true);
-  return new Blob([lh, nm, data, ch, nm, en]);
+function makeZip(name, data){ return makeZipN([{name, data}]); }
+function makeZipN(files){                 // "store" zip with several files, no external library
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  for(const f of files){
+    const nm = enc.encode(f.name), data = f.data instanceof Uint8Array ? f.data : new Uint8Array(f.data), crc = crc32(data), n = data.length;
+    const lh = new DataView(new ArrayBuffer(30)), ch = new DataView(new ArrayBuffer(46));
+    lh.setUint32(0,0x04034b50,true); lh.setUint16(4,20,true); lh.setUint16(6,0x0800,true); lh.setUint16(12,0x21,true);
+    lh.setUint32(14,crc,true); lh.setUint32(18,n,true); lh.setUint32(22,n,true); lh.setUint16(26,nm.length,true);
+    ch.setUint32(0,0x02014b50,true); ch.setUint16(4,20,true); ch.setUint16(6,20,true); ch.setUint16(8,0x0800,true); ch.setUint16(14,0x21,true);
+    ch.setUint32(16,crc,true); ch.setUint32(20,n,true); ch.setUint32(24,n,true); ch.setUint16(28,nm.length,true); ch.setUint32(42,off,true);
+    parts.push(lh, nm, data); central.push(ch, nm); off += 30 + nm.length + n;
+  }
+  const csz = central.reduce((t, x) => t + (x.byteLength ?? x.length), 0), en = new DataView(new ArrayBuffer(22));
+  en.setUint32(0,0x06054b50,true); en.setUint16(8,files.length,true); en.setUint16(10,files.length,true); en.setUint32(12,csz,true); en.setUint32(16,off,true);
+  return new Blob([...parts, ...central, en]);
 }
 const safeName = s => String(s).replace(/[^\w一-龥-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 30) || 'model';
 async function deliverFile(filename, buf, mime='model/gltf-binary'){
@@ -2171,6 +2177,16 @@ async function deliverFile(filename, buf, mime='model/gltf-binary'){
   const url = URL.createObjectURL(new Blob([buf], {type:mime}));
   const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000); toast(`已导出 ${filename}`);
+}
+async function deliverZip(zipName, files){
+  const blob = makeZipN(files), dl = await cap('downloads');
+  if(dl){
+    try { await dl.save({filename: zipName, data: blob}); toast(`已保存 ${zipName}（解压后包含 ${files.map(f => f.name).join('、')}）`); }
+    catch(e){ if(e?.code !== 'declined') toast('无法保存：' + (e?.message || e?.code), true); }
+    return;
+  }
+  const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = zipName; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000); toast(`已导出 ${zipName}`);
 }
 async function exportAndDeliver(root, filename){
   toast('正在导出 GLB …');
@@ -2229,10 +2245,11 @@ function meshToPart(part, geo, e){
 function collectParts(){
   const parts = new Map();
   const add = (layer, name, hex, uid, mesh) => {
-    const key = layer + '|' + uid + '|' + hex;
-    let p = parts.get(key); if(!p) parts.set(key, p = {layer, name, hex, v:[], f:[]});
+    const op = opacityOf(mesh), key = layer + '|' + uid + '|' + hex + '|' + op;
+    let p = parts.get(key); if(!p) parts.set(key, p = {layer, name, hex, op, v:[], f:[]});
     meshToPart(p, mesh.geometry, mesh.matrixWorld.elements);
   };
+  const opacityOf = o => { const m = Array.isArray(o.material) ? o.material[0] : o.material; return m?.transparent && m.opacity < 1 ? Math.round(m.opacity*100)/100 : 1; };
   const colorOf = o => { const m = Array.isArray(o.material) ? o.material[0] : o.material; return m?.color ? m.color.getHex() : 0xcccccc; };
   const room = roomGroup.clone(true);
   room.traverse(o => { if(o.isGroup && o.userData?.wall != null) o.scale.y = 1; });   // undo the "wall fades when it blocks the view" effect
@@ -2262,39 +2279,60 @@ function collectParts(){
 async function build3dm(parts){
   const rhino = await loadRhino();
   const doc = new rhino.File3dm();
-  try { doc.settings().modelUnitSystem = rhino.UnitSystem.Millimeters; } catch {}
+  const soft = (f) => { try { f(); } catch(e){ console.warn('3dm optional step failed', e); } };   // optional attributes must never abort the export
+  soft(() => { doc.settings().modelUnitSystem = rhino.UnitSystem.Millimeters; });
   const cnt = t => typeof t.count === 'function' ? t.count() : t.count;
   const layerIdx = {}; let k = 0;
   for(const [name, col] of Object.entries(LAYER_DEF)){
-    const l = new rhino.Layer(); l.name = name; l.color = hexRGB(parseInt(col.slice(1), 16));
+    const l = new rhino.Layer(); l.name = name; soft(() => { l.color = hexRGB(parseInt(col.slice(1), 16)); });
     doc.layers().add(l);
     const c = cnt(doc.layers()); layerIdx[name] = Number.isFinite(c) ? c - 1 : k; k++;
   }
+  const mats = new Map();     // one Rhino material per colour / opacity
+  const material = (hex, op) => {
+    const key = hex + '|' + op; if(mats.has(key)) return mats.get(key);
+    let idx = -1;
+    soft(() => {
+      const m = new rhino.Material(); m.name = 'RoomKit_' + hex.toString(16).padStart(6, '0') + (op < 1 ? '_glass' : '');
+      m.diffuseColor = hexRGB(hex); if(op < 1) m.transparency = 1 - op;
+      doc.materials().add(m); const c = cnt(doc.materials()); idx = Number.isFinite(c) ? c - 1 : mats.size;
+    });
+    mats.set(key, idx); return idx;
+  };
+  let nObj = 0;
   for(const p of parts){
     const m = new rhino.Mesh(), vs = m.vertices(), fs = m.faces();
     for(let i=0;i<p.v.length;i+=3) vs.add(p.v[i], p.v[i+1], p.v[i+2]);
     for(let i=0;i<p.f.length;i+=3) fs.addTriFace(p.f[i], p.f[i+1], p.f[i+2]);
-    try { m.normals().computeNormals(); } catch {}
-    try { m.compact(); } catch {}
+    soft(() => m.normals().computeNormals());
+    soft(() => m.compact());
     const at = new rhino.ObjectAttributes();
-    at.layerIndex = layerIdx[p.layer]; at.name = p.name;
-    at.objectColor = hexRGB(p.hex); at.colorSource = rhino.ObjectColorSource.ColorFromObject;
-    doc.objects().add(m, at);
+    at.name = p.name; soft(() => { at.layerIndex = layerIdx[p.layer]; });
+    soft(() => { at.objectColor = hexRGB(p.hex); at.colorSource = rhino.ObjectColorSource.ColorFromObject; });
+    const mi = material(p.hex, p.op ?? 1);
+    if(mi >= 0) soft(() => { at.materialIndex = mi; at.materialSource = rhino.ObjectMaterialSource.MaterialFromObject; });
+    doc.objects().add(m, at); nObj++;
   }
   const out = doc.toByteArray().slice();
-  try { doc.delete(); } catch {}
+  soft(() => doc.delete());
+  console.info('3dm export:', nObj, 'objects,', mats.size, 'materials,', out.length, 'bytes');
   return out;
 }
-function buildObj(parts){        // fallback when the 3dm library cannot be loaded; Rhino / Revit-via-plugins / Blender all read OBJ
-  const L = ['# RoomKit scene, units: mm, Z up'];
+function buildObj(parts){        // fallback when the 3dm library cannot be loaded: OBJ + MTL (colours, glass transparency)
+  const L = ['# RoomKit scene, units: mm, Z up', 'mtllib roomkit-scene.mtl'], M = ['# RoomKit materials'], seen = new Set();
   let off = 1;
   for(const p of parts){
-    L.push('o ' + (p.layer + '_' + p.name).replace(/\s+/g, '_'));
+    const mn = 'RoomKit_' + p.hex.toString(16).padStart(6, '0') + (p.op < 1 ? '_glass' : '');
+    if(!seen.has(mn)){
+      seen.add(mn);
+      M.push(`newmtl ${mn}`, `Kd ${(((p.hex>>16)&255)/255).toFixed(4)} ${(((p.hex>>8)&255)/255).toFixed(4)} ${((p.hex&255)/255).toFixed(4)}`, 'Ka 0 0 0', 'Ks 0.1 0.1 0.1', `d ${(p.op ?? 1).toFixed(2)}`, 'illum 2', '');
+    }
+    L.push('o ' + (p.layer + '_' + p.name).replace(/\s+/g, '_'), 'usemtl ' + mn);
     for(let i=0;i<p.v.length;i+=3) L.push(`v ${p.v[i].toFixed(2)} ${p.v[i+1].toFixed(2)} ${p.v[i+2].toFixed(2)}`);
     for(let i=0;i<p.f.length;i+=3) L.push(`f ${p.f[i]+off} ${p.f[i+1]+off} ${p.f[i+2]+off}`);
     off += p.v.length / 3;
   }
-  return L.join('\n') + '\n';
+  return {obj: L.join('\n') + '\n', mtl: M.join('\n') + '\n'};
 }
 async function exportRhino(){
   if(!state.items.length && !state.walls.length && !state.rooms.length){ toast('场景是空的，没有可导出的内容', true); return; }
@@ -2305,8 +2343,9 @@ async function exportRhino(){
     await deliverFile('roomkit-scene.3dm', await build3dm(parts), 'application/octet-stream');
   } catch(e){
     console.warn('3dm export failed, falling back to OBJ', e);
-    await deliverFile('roomkit-scene.obj', new TextEncoder().encode(buildObj(parts)), 'text/plain');
-    toast('3DM 组件没能加载（可能被网络或沙盒阻止），已改为导出 OBJ，Rhino 可直接打开', true);
+    const {obj, mtl} = buildObj(parts), enc = new TextEncoder();
+    await deliverZip('roomkit-scene-obj.zip', [{name:'roomkit-scene.obj', data:enc.encode(obj)}, {name:'roomkit-scene.mtl', data:enc.encode(mtl)}]);
+    toast('3DM 导出失败（' + String(e?.message || e).slice(0, 80) + '），已改为导出 OBJ + MTL，解压后一起放在同一文件夹再导入 Rhino', true);
   }
 }
 
